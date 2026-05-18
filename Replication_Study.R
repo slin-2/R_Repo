@@ -1,139 +1,293 @@
+#Richmond, VA MSA
+
+
+
 library(tidycensus)
 library(tidyverse)
-library(segregation)
-library(tigris)
 library(sf)
-ca_acs_data <- get_acs(
-  geography = "tract",
-  variables = c(
-    white = "B03002_003",
-    black = "B03002_004",
-    asian = "B03002_006",
-    hispanic = "B03002_012"
-  ),
-  state = "CA",
-  geometry = TRUE,
-  year = 2019
-)
-# Use tidycensus to get urbanized areas by population with geometry,
-# then filter for those that have populations of 750,000 or more
-us_urban_areas <- get_acs(
-  geography = "urban area",
-  variables = "B01001_001",
-  geometry = TRUE,
-  year = 2019,
-  survey = "acs1"
-) %>%
-  filter(estimate >= 750000) %>%
-  transmute(urban_name = str_remove(NAME,
-                                    fixed(", CA Urbanized Area (2010)")))
-# Compute an inner spatial join between the California tracts and the
-# urbanized areas, returning tracts in the largest California urban
-# areas with the urban_name column appended
-ca_urban_data <- ca_acs_data %>%
-  st_join(us_urban_areas, left = FALSE) %>%
-  select(-NAME) %>%
-  st_drop_geometry()
+library(tmap)
+library(tigris)
+library(scales)
 
-mutual_within(
-  data = ca_urban_data,
-  group = "variable",
-  unit = "GEOID",
-  weight = "estimate",
-  within = "urban_name",
-  wide = TRUE
+options(tigris_use_cache = TRUE)
+sf::sf_use_s2(FALSE)
+
+dir.create("figures", showWarnings = FALSE)
+
+
+classify_landscape <- function(density_km2) {
+  case_when(
+    density_km2 >  1900 ~ "Urban high",
+    density_km2 >= 800  ~ "Urban low",
+    density_km2 >= 550  ~ "Suburban high",
+    density_km2 >= 250  ~ "Suburban low",
+    TRUE                ~ "Exurban"
+  )
+}
+
+landscape_levels <- c("Urban high","Urban low",
+                      "Suburban high","Suburban low","Exurban")
+
+landscape_palette <- c(
+  "Urban high"    = "#67000d",
+  "Urban low"     = "#cb181d",
+  "Suburban high" = "#fd8d3c",
+  "Suburban low"  = "#fdd49e",
+  "Exurban"       = "#74c476"
 )
-sf_local_seg <- ca_urban_data %>%
-  filter(urban_name == "San Francisco--Oakland") %>%
-  mutual_local(
-    group = "variable",
-    unit = "GEOID",
-    weight = "estimate",
-    wide = TRUE
+
+
+
+va_tracts <- get_decennial(
+  geography = "tract",
+  variables = "P1_001N",
+  state     = "VA",
+  year      = 2020,
+  sumfile   = "pl",
+  geometry  = TRUE
+) |>
+  rename(pop = value)
+
+
+cbsa_all <- core_based_statistical_areas(year = 2020, cb = TRUE)
+richmond_msa <- cbsa_all |>
+  filter(GEOID == "40060")   # "Richmond, VA Metro Area"
+
+
+va_tracts   <- st_transform(va_tracts,   26918)
+richmond_msa <- st_transform(richmond_msa, 26918)
+
+# Spatial filter: keep tracts whose centroids fall inside the MSA.
+tract_centroids <- st_centroid(va_tracts)
+inside <- st_within(tract_centroids, richmond_msa, sparse = FALSE)[,1]
+rva <- va_tracts[inside, ]
+
+
+rva <- rva |>
+  mutate(
+    area_km2    = as.numeric(st_area(geometry)) / 1e6,
+    density_km2 = pop / area_km2,
+    landscape   = factor(classify_landscape(density_km2),
+                         levels = landscape_levels)
   )
 
-sf_tracts_seg <- tracts("CA", cb = TRUE, year = 2019) %>%
-  inner_join(sf_local_seg, by = "GEOID")
+#race
+race_vars <- c(
+  total    = "P2_001N",
+  hispanic = "P2_002N",
+  white    = "P2_005N",
+  black    = "P2_006N",
+  aian     = "P2_007N",
+  asian    = "P2_008N"
+)
 
-sf_tracts_seg %>%
-  ggplot(aes(fill = ls)) +
-  geom_sf(color = NA) +
-  coord_sf(crs = 26943) +
-  scale_fill_distiller(palette = "RdPu", direction = 1) +
-  theme_void() +
-  labs(fill = "Local\nsegregation index")
+race_va <- get_decennial(
+  geography = "tract",
+  variables = race_vars,
+  state     = "VA",
+  year      = 2020,
+  sumfile   = "pl",
+  output    = "wide",
+  geometry  = FALSE
+)
 
 
-------------------------------
+rva <- rva |>
+  left_join(race_va, by = "GEOID") |>
+  mutate(
+    pct_black    = 100 * black    / total,
+    pct_white    = 100 * white    / total,
+    pct_hispanic = 100 * hispanic / total,
+    pct_asian    = 100 * asian    / total
+  )
 
-  library(sf)
-library(tidyverse)
-library(tidycensus)
-library(tigris)
-library(tmap)
-library(rmapshaper)
-library(flextable)
+# Map 1: percent Black
+map_pct_black <- ggplot(rva) +
+  geom_sf(aes(fill = pct_black), color = NA) +
+  geom_sf(data = richmond_msa, fill = NA, color = "black", size = 0.6) +
+  scale_fill_viridis_c(
+    option = "magma", direction = -1,
+    name = "% Black\n(non-Hispanic)",
+    limits = c(0, 100), na.value = "grey90"
+  ) +
+  labs(
+    title    = "Share of Black residents by tract, Richmond MSA",
+    subtitle = "2020 Decennial Census (P.L. 94-171)",
+    caption  = "Source: U.S. Census Bureau, Table P2"
+  ) +
+  theme_void(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
 
-# Bring in 2019-2023 census tract data using the Census API
-ca.tracts <- get_acs(geography = "tract",
-                     year = 2023,
-                     variables = c(tpop = "B03002_001",
-                                   white = "B03002_003", black = "B03002_004",
-                                   asian = "B03002_006", hisp = "B03002_012"),
-                     state = "CA",
-                     survey = "acs5",
-                     output = "wide",
-                     geometry = TRUE)
+ggsave("figures/06_pct_black_map.png",
+       map_pct_black, width = 9, height = 7, dpi = 300)
 
-# Calculate, rename and keep essential vars.
-ca.tracts <- ca.tracts %>%
-  mutate(pwhite = 100*(whiteE/tpopE), pasian = 100*(asianE/tpopE),
-         pblack = 100*(blackE/tpopE), phisp = 100*(hispE/tpopE)) %>%
-  rename(white = whiteE, asian = asianE, black = blackE,
-         hisp = hispE, tpop = tpopE) %>%
-  select(GEOID, tpop, pwhite, pasian, pblack, phisp,
-         white, asian, black, hisp)
 
-# Bring in city boundaries
-pl <- places(state = "CA", year = 2023, cb = TRUE)
+map_landscapes <- ggplot(rva) +
+  geom_sf(aes(fill = landscape), color = "white", size = 0.05) +
+  geom_sf(data = richmond_msa, fill = NA, color = "black", size = 0.6) +
+  scale_fill_manual(values = landscape_palette, name = "Landscape") +
+  labs(
+    title    = "Richmond, VA MSA: Landscape classification (Hanberry 2022)",
+    subtitle = "2020 Decennial Census, tract-level population density",
+    caption  = "Source: U.S. Census Bureau"
+  ) +
+  theme_void(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
 
-# Keep San Francisco
-large.cities <- pl %>%
-  filter(NAME == "San Francisco")
+ggsave("figures/01_landscape_map.png",
+       map_landscapes, width = 9, height = 7, dpi = 300)
 
-# Clip tracts in San Francisco
-large.tracts <- ms_clip(target = ca.tracts,
-                        clip = large.cities,
-                        remove_slivers = TRUE)
 
-# Join city info to tracts
-large.tracts <- large.tracts %>%
-  st_join(large.cities)
+acs_vars <- c(
+  median_income = "B19013_001",   # median household income
+  median_age    = "B01002_001",   # median age
+  pct_bach      = "B15003_022",   # bachelor's degree count (will normalize)
+  pop_25plus    = "B15003_001",   # denominator for education
+  median_rent   = "B25064_001"    # median gross rent
+)
 
-# Calculate citywide totals
-large.tracts <- large.tracts %>%
-  group_by(NAME) %>%
-  mutate(whitec = sum(white), asianc = sum(asian),
-         blackc = sum(black), hispc = sum(hisp),
-         tpopc = sum(tpop))
+acs_rva <- get_acs(
+  geography = "tract",
+  variables = acs_vars,
+  state     = "VA",
+  year      = 2020,
+  survey    = "acs5",
+  output    = "wide",
+  geometry  = FALSE
+) |>
+  mutate(pct_bachelors = 100 * pct_bachE / pop_25plusE) |>
+  select(GEOID, median_income = median_incomeE,
+         median_age = median_ageE,
+         median_rent = median_rentE,
+         pct_bachelors)
 
-# Location Quotient for San Francisco tracts
-fresno.tracts <- large.tracts %>%
-  filter(NAME == "San Francisco") %>%
-  mutate(blklq = (black/tpop)/(blackc/tpopc),
-         asnlq = (asian/tpop)/(asianc/tpopc),
-         hisplq = (hisp/tpop)/(hispc/tpopc),
-         whitelq = (white/tpop)/(whitec/tpopc))
+rva <- rva |> left_join(acs_rva, by = "GEOID")
 
-# Histogram of Black LQ
-fresno.tracts %>%
-  ggplot() +
-  geom_histogram(mapping = aes(x = blklq), na.rm = TRUE) +
-  xlab("Black Location Quotient")
 
-fresno.tracts %>%
-  filter(!is.na(asnlq)) %>%
-  tm_shape(unit = "mi") +
-  tm_polygons(fill = "asnlq",
-              fill.scale = tm_scale(style = "quantile", values = "BuGn"),
-              fill.legend = tm_legend(title = "Asian Location Quotient For San Francisco"))
+# median household income by landscape
+
+chart_income <- rva |>
+  st_drop_geometry() |>
+  filter(!is.na(median_income)) |>
+  ggplot(aes(landscape, median_income, fill = landscape)) +
+  geom_boxplot(outlier.alpha = 0.4) +
+  scale_fill_manual(values = landscape_palette, guide = "none") +
+  scale_y_continuous(labels = label_dollar()) +
+  labs(
+    title = "Median household income by landscape, Richmond MSA",
+    subtitle = "ACS 5-year, 2016-2020",
+    x = NULL, y = "Median household income"
+  ) +
+  theme_minimal(base_size = 11)
+
+ggsave("figures/02_income_by_landscape.png",
+       chart_income, width = 8, height = 5, dpi = 300)
+
+
+map_income <- ggplot(rva) +
+  geom_sf(aes(fill = median_income), color = NA) +
+  scale_fill_viridis_c(option = "magma", labels = label_dollar(),
+                       name = "Median HH income", na.value = "grey90") +
+  labs(title = "Median household income by tract, Richmond MSA",
+       caption = "ACS 2016-2020") +
+  theme_void(base_size = 11)
+
+ggsave("figures/03_income_map.png",
+       map_income, width = 9, height = 7, dpi = 300)
+
+# Pop Pyramid
+rva_counties <- c(
+  "Richmond city", "Henrico", "Chesterfield", "Hanover",
+  "Powhatan", "Goochland", "New Kent", "Charles City",
+  "Amelia", "Caroline", "Dinwiddie", "King William",
+  "Prince George", "Sussex",
+  "Petersburg city", "Hopewell city", "Colonial Heights city"
+)
+
+age_sex <- get_acs(
+  geography = "tract",
+  table     = "B01001",
+  state     = "VA",
+  county    = rva_counties,
+  year      = 2020,
+  survey    = "acs5",
+  geometry  = FALSE
+)
+
+# Mapping of B01001 variable -> sex + age band
+# Male:   B01001_003 ... _025;  Female: B01001_027 ... _049
+age_lookup <- tribble(
+  ~suffix,         ~age,
+  "003","Under 5",  "004","5-9",     "005","10-14",   "006","15-17",
+  "007","18-19",    "008","20",      "009","21",      "010","22-24",
+  "011","25-29",    "012","30-34",   "013","35-39",   "014","40-44",
+  "015","45-49",    "016","50-54",   "017","55-59",   "018","60-61",
+  "019","62-64",    "020","65-66",   "021","67-69",   "022","70-74",
+  "023","75-79",    "024","80-84",   "025","85+"
+)
+
+# Collapse into 5-year bands for a cleaner pyramid
+age_bands <- c("0-14","15-24","25-34","35-44","45-54","55-64","65-74","75+")
+band_for <- function(age) {
+  case_when(
+    age %in% c("Under 5","5-9","10-14")          ~ "0-14",
+    age %in% c("15-17","18-19","20","21","22-24") ~ "15-24",
+    age %in% c("25-29","30-34")                  ~ "25-34",
+    age %in% c("35-39","40-44")                  ~ "35-44",
+    age %in% c("45-49","50-54")                  ~ "45-54",
+    age %in% c("55-59","60-61","62-64")          ~ "55-64",
+    age %in% c("65-66","67-69","70-74")          ~ "65-74",
+    age %in% c("75-79","80-84","85+")            ~ "75+"
+  )
+}
+
+age_long <- age_sex |>
+  mutate(
+    suffix = str_extract(variable, "_(\\d{3})$") |> str_remove("_"),
+    code   = as.integer(suffix),
+    sex    = case_when(code >= 3  & code <= 25 ~ "Male",
+                       code >= 27 & code <= 49 ~ "Female",
+                       TRUE ~ NA_character_),
+    suffix_norm = if_else(sex == "Female",
+                          sprintf("%03d", code - 24),
+                          suffix)
+  ) |>
+  filter(!is.na(sex)) |>
+  left_join(age_lookup, by = c("suffix_norm" = "suffix")) |>
+  filter(!is.na(age)) |>
+  mutate(band = factor(band_for(age), levels = age_bands))
+
+# Bring in landscape labels per tract
+tract_landscape <- rva |> st_drop_geometry() |> select(GEOID, landscape)
+
+age_long <- age_long |>
+  left_join(tract_landscape, by = "GEOID") |>
+  mutate(group = case_when(
+    landscape %in% c("Urban high","Urban low")       ~ "Urban",
+    landscape %in% c("Suburban high","Suburban low") ~ "Suburban",
+    TRUE ~ NA_character_
+  )) |>
+  filter(!is.na(group))
+
+pyramid_data <- age_long |>
+  group_by(group, sex, band) |>
+  summarise(pop = sum(estimate, na.rm = TRUE), .groups = "drop") |>
+  mutate(pop_signed = if_else(sex == "Male", -pop, pop))
+
+make_pyramid <- function(df, ttl) {
+  ggplot(df, aes(x = band, y = pop_signed, fill = sex)) +
+    geom_col() +
+    coord_flip() +
+    scale_y_continuous(labels = function(x) comma(abs(x))) +
+    scale_fill_manual(values = c(Male = "#1f78b4", Female = "#e31a1c")) +
+    labs(title = ttl, x = "Age band", y = "Population", fill = NULL) +
+    theme_minimal(base_size = 11)
+}
+
+pyr_urban    <- make_pyramid(filter(pyramid_data, group == "Urban"),
+                             "Population pyramid - Urban tracts (Richmond MSA)")
+pyr_suburban <- make_pyramid(filter(pyramid_data, group == "Suburban"),
+                             "Population pyramid - Suburban tracts (Richmond MSA)")
+
+ggsave("figures/04_pyramid_urban.png",    pyr_urban,    width = 7, height = 5, dpi = 300)
+ggsave("figures/05_pyramid_suburban.png", pyr_suburban, width = 7, height = 5, dpi = 300)
